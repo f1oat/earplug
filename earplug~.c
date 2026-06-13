@@ -32,6 +32,9 @@ t_float earplug_impulses[368][2][128] = {{{0.0f}}};
 
 static t_class *earplug_class;
 
+/* number of azimuth samples per elevation ring from -40..80 degrees */
+static const unsigned earplug_azim_count[13] = {29, 31, 37, 37, 37, 37, 37, 31, 29, 23, 19, 13, 7};
+
 typedef struct _earplug
 {
     t_object x_obj; 
@@ -42,8 +45,7 @@ typedef struct _earplug
     t_float ele;
     unsigned ch_L;
     unsigned ch_R;
-     
-    t_float azimScale[13];
+
     unsigned int azimOffset[13];
 
     t_float ir[2][128];
@@ -67,37 +69,49 @@ static t_int *earplug_perform(t_int *w)
     { 
         /* a quantized version of the elevation */
         int elevInt = (int)floor(x->ele);
-        /* used as the index to the array of scaling factors for the azimuth
-           (adding 4 because the lowest elevation is -4, so it starts at 0) */
+          /* index into elevation rings (-40..80 by 10 deg)
+              adding 4 because the lowest elevation is -4 (in 10-degree units) */
         unsigned elevGridIndex = elevInt + 4;
-        unsigned azimIntUp = (unsigned)(x->azi * x->azimScale[elevGridIndex+1]);
-        float azimFracUp = azimIntUp + 1.0 - x->azi * x->azimScale[elevGridIndex+1];
-        float azimFracUpInv = 1.0 - azimFracUp;
-        float elevFracUp = x->ele - elevInt * 1.0;
-        unsigned azimIntDown = (unsigned)(x->azi * x->azimScale[elevGridIndex]);
-        float azimFracDown = azimIntDown + 1.0 - x->azi * x->azimScale[elevGridIndex];
-        float azimFracDownInv = 1.0 - azimFracDown;
-        float elevFracDown = 1.0 - elevFracUp;
-        unsigned lowerIdx = x->azimOffset[elevGridIndex] + azimIntDown;
-        unsigned upperIdx = x->azimOffset[elevGridIndex + 1] + azimIntUp;
+        float elevFracUp = x->ele - (float)elevInt;
+        float elevFracDown = 1.0f - elevFracUp;
+
+        unsigned downCount = earplug_azim_count[elevGridIndex];
+        unsigned upCount = earplug_azim_count[elevGridIndex + 1];
+        unsigned lowerBase = x->azimOffset[elevGridIndex];
+        unsigned upperBase = x->azimOffset[elevGridIndex + 1];
+
+        float downPos = x->azi * (float)(downCount - 1) / 180.0f;
+        unsigned downIdx0 = (unsigned)floorf(downPos);
+        unsigned downIdx1 = downIdx0 + 1;
+        if (downIdx1 >= downCount)
+            downIdx1 = downIdx0;
+        float downFrac = (downIdx1 == downIdx0) ? 0.0f : (downPos - (float)downIdx0);
+        float downW0 = 1.0f - downFrac;
+        float downW1 = downFrac;
+
+        float upPos = x->azi * (float)(upCount - 1) / 180.0f;
+        unsigned upIdx0 = (unsigned)floorf(upPos);
+        unsigned upIdx1 = upIdx0 + 1;
+        if (upIdx1 >= upCount)
+            upIdx1 = upIdx0;
+        float upFrac = (upIdx1 == upIdx0) ? 0.0f : (upPos - (float)upIdx0);
+        float upW0 = 1.0f - upFrac;
+        float upW1 = upFrac;
         
         for (i = 0; i < 128; i++)
         {
-            /* elevFracDown: interpolate the lower two HRIRs and multiply them by their "fraction"
-                 elevFracUp: interpolate the upper two HRIRs and multiply them by their "fraction" */
-            x->ir[x->ch_L][i] = elevFracDown *
-                                        (azimFracDown * x->impulses[lowerIdx][0][i] + 
-                                        azimFracDownInv * x->impulses[lowerIdx + 1][0][i]) +
-                                        elevFracUp *
-                                        (azimFracUp * x->impulses[upperIdx][0][i] + 
-                                        azimFracUpInv * x->impulses[upperIdx + 1][0][i]);
+            /* bilinear interpolation in azimuth/elevation with clamped azimuth neighbors */
+            t_float lowerL = downW0 * x->impulses[lowerBase + downIdx0][0][i]
+                           + downW1 * x->impulses[lowerBase + downIdx1][0][i];
+            t_float lowerR = downW0 * x->impulses[lowerBase + downIdx0][1][i]
+                           + downW1 * x->impulses[lowerBase + downIdx1][1][i];
+            t_float upperL = upW0 * x->impulses[upperBase + upIdx0][0][i]
+                           + upW1 * x->impulses[upperBase + upIdx1][0][i];
+            t_float upperR = upW0 * x->impulses[upperBase + upIdx0][1][i]
+                           + upW1 * x->impulses[upperBase + upIdx1][1][i];
 
-            x->ir[x->ch_R][i] = elevFracDown *
-                                        (azimFracDown * x->impulses[lowerIdx][1][i] +
-                                        azimFracDownInv * x->impulses[lowerIdx + 1][1][i]) +
-                                        elevFracUp *
-                                        (azimFracUp * x->impulses[upperIdx][1][i] +
-                                        azimFracUpInv * x->impulses[upperIdx + 1][1][i]);
+            x->ir[x->ch_L][i] = elevFracDown * lowerL + elevFracUp * upperL;
+            x->ir[x->ch_R][i] = elevFracDown * lowerR + elevFracUp * upperR;
         }
     }
     else
@@ -105,22 +119,31 @@ static t_int *earplug_perform(t_int *w)
         /* if elevation is 80 degrees or more the interpolation requires only
            three points (because there's only one HRIR at 90 deg) */
 
-        /* scale the azimuth to 12 (the number of HRIRs at 80 deg) discreet points */
-        unsigned azimIntDown = (unsigned)(x->azi * 0.033333);
-        float azimFracDown = azimIntDown + 1.0 - x->azi * 0.033333;
-        float elevFracUp = x->ele - 8.0;
-        float elevFracDown = 9.0 - x->ele;
+        /* interpolate around the 80-degree ring, then blend toward the single 90-degree HRIR */
+        const unsigned elev80Base = x->azimOffset[12];
+        const unsigned elev80Count = earplug_azim_count[12];
+        float azimPos = x->azi * (float)(elev80Count - 1) / 180.0f;
+        unsigned azimIdx0 = (unsigned)floorf(azimPos);
+        unsigned azimIdx1 = azimIdx0 + 1;
+        if (azimIdx1 >= elev80Count)
+            azimIdx1 = azimIdx0;
+        float azimFrac = (azimIdx1 == azimIdx0) ? 0.0f : (azimPos - (float)azimIdx0);
+        float azimW0 = 1.0f - azimFrac;
+        float azimW1 = azimFrac;
+
+        float elevFracUp = x->ele - 8.0f;
+        float elevFracDown = 1.0f - elevFracUp;
         for (i = 0; i < 128; i++)
         {
             /* elevFracDown: these two lines interpolate the lower two HRIRs
                  elevFracUp: multiply the 90 degree HRIR with its corresponding fraction */
             x->ir[x->ch_L][i] = elevFracDown *
-                                        (azimFracDown * x->impulses[360+azimIntDown][0][i] +
-                                        (1.0 - azimFracDown) * x->impulses[361+azimIntDown][0][i])
+                                        (azimW0 * x->impulses[elev80Base + azimIdx0][0][i] +
+                                        azimW1 * x->impulses[elev80Base + azimIdx1][0][i])
                                         + elevFracUp * x->impulses[367][0][i];
             x->ir[x->ch_R][i] = elevFracDown *
-                                        (azimFracDown * x->impulses[360+azimIntDown][1][i]  +
-                                        (1.0 - azimFracDown) * x->impulses[361+azimIntDown][1][i])
+                                        (azimW0 * x->impulses[elev80Base + azimIdx0][1][i] +
+                                        azimW1 * x->impulses[elev80Base + azimIdx1][1][i])
                                         + elevFracUp * x->impulses[367][1][i]; 
         }
     }
@@ -190,10 +213,10 @@ static void *earplug_new(t_floatarg azimArg, t_floatarg elevArg)
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, gensym("float"), gensym("azimuth"));
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, gensym("float"), gensym("elevation"));
 
-    x->azi = azimArg;
-    x->ele = elevArg;
     x->ch_L = 0;
     x->ch_R = 1;
+    earplug_azimuth(x, azimArg);
+    earplug_elevation(x, elevArg);
 
     int i, j;
     FILE *fp;
@@ -233,17 +256,6 @@ static void *earplug_new(t_floatarg azimArg, t_floatarg elevArg)
     for (i = 0; i < 128; i++)
          x->convBuffer[i] = 0.f; 
     x->bufferPin = 0;
-
-    /* this is the scaling factor for the azimuth so that it
-       corresponds to an HRTF in the KEMAR database */
-    x->azimScale[0] = x->azimScale[8] = 0.153846153;   /* -40 and 40 degree */
-    x->azimScale[1] = x->azimScale[7] = 0.166666666;   /* -30 and 30 degree */
-    x->azimScale[2] = x->azimScale[3] = x->azimScale[4]
-                    = x->azimScale[5] = x->azimScale[6] = 0.2; /* -20 to 20 degree */
-    x->azimScale[9] = 0.125;        /* 50 degree */
-    x->azimScale[10] = 0.1;         /* 60 degree */
-    x->azimScale[11] = 0.066666666; /* 70 degree */
-    x->azimScale[12] = 0.033333333; /* 80 degree */
 
     x->azimOffset[0] = 0; 
     x->azimOffset[1] = 29;

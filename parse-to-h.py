@@ -11,7 +11,7 @@
 
 import sys
 
-datafile = "earplug_data.txt"
+datafile = "earplug_data_compensated.txt"
 if len(sys.argv) > 1:
     datafile = sys.argv[1]
 
